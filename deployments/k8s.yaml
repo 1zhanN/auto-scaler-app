@@ -1,0 +1,152 @@
+# ===== RESNET SERVER (Scale to 3 replicas) =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resnet-deployment
+spec:
+  replicas: 1                    # 👈 Start with 1 replica, we will scale up later
+  selector:
+    matchLabels:
+      app: resnet-server
+  template:
+    metadata:
+      labels:
+        app: resnet-server
+    spec:
+      containers:
+        - name: resnet-server
+          image: 1zhann/ai-model-server:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1G"
+            limits:
+              cpu: "1"
+              memory: "1G"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resnet-server
+spec:
+  selector:
+    app: resnet-server
+  ports:
+    - protocol: TCP
+      port: 8001
+      targetPort: 8001
+  type: ClusterIP             
+
+---
+# ===== DISPATCHER (NEW) =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dispatcher
+  template:
+    metadata:
+      labels:
+        app: dispatcher
+    spec:
+      containers:
+        - name: dispatcher
+          image: 1zhann/ai-dispatcher:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1G"
+            limits:
+              cpu: "1"
+              memory: "1G"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dispatcher
+spec:
+  selector:
+    app: dispatcher
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 5000
+  type: NodePort              # 👈 External access for Locust
+
+---
+# ===== PROMETHEUS (NEW) =====
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: 'dispatcher'
+        static_configs:
+          - targets: ['dispatcher:5000']
+        metrics_path: '/metrics'
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: storage
+              mountPath: /prometheus
+          args:
+            - '--config.file=/etc/prometheus/prometheus.yml'
+            - '--storage.tsdb.path=/prometheus'
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: storage
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - protocol: TCP
+      port: 9090
+      targetPort: 9090
+  type: NodePort
