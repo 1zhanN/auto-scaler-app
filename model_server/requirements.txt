@@ -1,0 +1,6 @@
+torch 
+torchvision 
+aiohttp
+opencv-python
+requests
+pillow
