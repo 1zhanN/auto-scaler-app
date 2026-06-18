@@ -4,7 +4,7 @@ kind: Deployment
 metadata:
   name: resnet-deployment
 spec:
-  replicas: 1                    # 👈 Start with 1 replica, we will scale up later
+  replicas: 3
   selector:
     matchLabels:
       app: resnet-server
@@ -38,10 +38,10 @@ spec:
     - protocol: TCP
       port: 8001
       targetPort: 8001
-  type: ClusterIP             
+  type: ClusterIP
 
 ---
-# ===== DISPATCHER (NEW) =====
+# ===== DISPATCHER =====
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,10 +81,10 @@ spec:
     - protocol: TCP
       port: 5000
       targetPort: 5000
-  type: NodePort              # 👈 External access for Locust
+  type: NodePort
 
 ---
-# ===== PROMETHEUS (NEW) =====
+# ===== PROMETHEUS =====
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -150,3 +150,65 @@ spec:
       port: 9090
       targetPort: 9090
   type: NodePort
+
+---
+# ===== CUSTOM AUTOSCALER =====
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscaler
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: autoscaler-role
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autoscaler-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: autoscaler-role
+subjects:
+  - kind: ServiceAccount
+    name: autoscaler
+    namespace: default
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-autoscaler
+  template:
+    metadata:
+      labels:
+        app: custom-autoscaler
+    spec:
+      serviceAccountName: autoscaler
+      containers:
+        - name: autoscaler
+          image: 1zhann/custom-autoscaler:latest
+          imagePullPolicy: Always
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:9090"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
