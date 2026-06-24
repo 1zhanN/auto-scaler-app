@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-httpx
+requests
 opencv-python
 numpy
 python-multipart
 prometheus-client
+httpx

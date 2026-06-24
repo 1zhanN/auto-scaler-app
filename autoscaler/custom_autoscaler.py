@@ -1,100 +1,149 @@
-import requests
 import time
+import requests
 from kubernetes import client, config
-import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Load Kubernetes config
+# Load in-cluster config
 config.load_incluster_config()
-v1 = client.AppsV1Api()
+apps_v1 = client.AppsV1Api()
 
-PROMETHEUS_URL = "http://prometheus:9090"
-NAMESPACE = "default"
-DEPLOYMENT = "resnet-deployment"
-MIN_REPLICAS = 3
-MAX_REPLICAS = 10
-CHECK_INTERVAL = 10  # seconds
+# ---------------- Configuration ----------------
+PROMETHEUS_URL      = "http://prometheus:9090"                 # your manually-deployed Prometheus service
+DISPATCHER_FALLBACK = "http://dispatcher:5000/metrics/json"     # matches your dispatcher service name/port
+DEPLOYMENT_NAME      = "resnet-deployment"                      # matches your actual deployment name
+NAMESPACE            = "default"
+MIN_REPLICAS         = 1
+MAX_REPLICAS         = 6
+INTERVAL             = 5  # check every 5s
 
-# Queue depth thresholds
-QUEUE_DEPTH_THRESHOLDS = {
-    5: 3,      # queue <= 5, keep 3 replicas
-    10: 5,     # queue <= 10, scale to 5
-    20: 7,     # queue <= 20, scale to 7
-    50: 10,    # queue > 20, scale to 10
-}
+# Thresholds
+SCALE_UP_QUEUE_THRESHOLD     = 2
+SCALE_UP_LATENCY_THRESHOLD   = 0.35   # scale up if p99 > 0.35s
+SCALE_DOWN_LATENCY_THRESHOLD = 0.35   # scale down if p99 < 0.35s
 
-def get_queue_depth():
-    """Query Prometheus for current queue size"""
+# Cooldown tracking
+last_scale_up_time   = 0
+last_scale_down_time = 0
+SCALE_UP_COOLDOWN    = 8  # wait 8s before scaling up again
+SCALE_DOWN_COOLDOWN  = 30  # wait 30s before scaling down again
+
+
+def query_prometheus(promql):
     try:
-        query = "dispatcher_queue_size"
         response = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query",
-            params={"query": query},
+            params={"query": promql},
             timeout=5
         )
-        data = response.json()
-        
-        if data["status"] == "success" and data["data"]["result"]:
-            queue_size = float(data["data"]["result"][0]["value"][1])
-            logger.info(f"Queue size: {queue_size}")
-            return queue_size
-        return 0
+        result = response.json()["data"]["result"]
+        if result:
+            return float(result[0]["value"][1])
+        return 0.0
     except Exception as e:
-        logger.error(f"Failed to query Prometheus: {e}")
-        return 0
+        print(f"Prometheus query error ({promql}): {e}")
+        return None  # signals fetch failure
 
-def calculate_target_replicas(queue_depth):
-    """Calculate target replicas based on queue depth"""
-    for threshold, replicas in sorted(QUEUE_DEPTH_THRESHOLDS.items()):
-        if queue_depth <= threshold:
-            return max(MIN_REPLICAS, replicas)
-    return MAX_REPLICAS
+
+def get_realtime_metrics():
+    queue_length = query_prometheus("dispatcher_queue_size")
+    p99_latency  = query_prometheus("dispatcher_p99_latency_seconds")
+
+    # Fallback to dispatcher /metrics/json when Prometheus is unavailable
+    if queue_length is None or p99_latency is None:
+        try:
+            response = requests.get(DISPATCHER_FALLBACK, timeout=3)
+            data = response.json()
+            print("Using dispatcher fallback for metrics")
+            return data.get("queue_length", 0), data.get("p99_latency", 0.0)
+        except Exception as e:
+            print(f"Dispatcher fallback also failed: {e}")
+            return None, None
+
+    return queue_length, p99_latency
+
 
 def get_current_replicas():
-    """Get current replica count"""
     try:
-        deployment = v1.read_namespaced_deployment(DEPLOYMENT, NAMESPACE)
+        deployment = apps_v1.read_namespaced_deployment(
+            name=DEPLOYMENT_NAME,
+            namespace=NAMESPACE
+        )
         return deployment.spec.replicas
     except Exception as e:
-        logger.error(f"Failed to get deployment: {e}")
+        print(f"Failed to get replicas: {e}")
         return MIN_REPLICAS
 
-def scale_deployment(target_replicas):
-    """Scale deployment to target replicas"""
+
+def scale_deployment(replicas):
     try:
-        deployment = v1.read_namespaced_deployment(DEPLOYMENT, NAMESPACE)
-        deployment.spec.replicas = target_replicas
-        v1.patch_namespaced_deployment(DEPLOYMENT, NAMESPACE, deployment)
-        logger.info(f"Scaled {DEPLOYMENT} to {target_replicas} replicas")
-        return True
+        replicas = max(MIN_REPLICAS, min(MAX_REPLICAS, replicas))
+        apps_v1.patch_namespaced_deployment_scale(
+            name=DEPLOYMENT_NAME,
+            namespace=NAMESPACE,
+            body={"spec": {"replicas": replicas}}
+        )
+        print(f"Scaled to {replicas} replicas")
     except Exception as e:
-        logger.error(f"Failed to scale deployment: {e}")
-        return False
+        print(f"Failed to scale: {e}")
 
-def autoscale_loop():
-    """Main autoscaler loop"""
-    logger.info("Custom Autoscaler started")
-    
+
+def autoscaler_loop():
+    global last_scale_up_time, last_scale_down_time
+
     while True:
-        try:
-            queue_depth = get_queue_depth()
-            current_replicas = get_current_replicas()
-            target_replicas = calculate_target_replicas(queue_depth)
-            
-            logger.info(
-                f"Queue: {queue_depth} | Current: {current_replicas} replicas | "
-                f"Target: {target_replicas} replicas"
-            )
-            
-            if target_replicas != current_replicas:
-                scale_deployment(target_replicas)
-            
-        except Exception as e:
-            logger.error(f"Error in autoscale loop: {e}")
-        
-        time.sleep(CHECK_INTERVAL)
+        queue_length, p99_latency = get_realtime_metrics()
+        current_replicas = get_current_replicas()
+        now = time.time()
 
-if __name__ == "__main__":
-    autoscale_loop()
+        print(f"\n--- Autoscaler Check ---")
+        print(f"Queue length: {queue_length}")
+        print(f"P99 latency: {p99_latency if p99_latency is None else f'{p99_latency}s'}")
+        print(f"Current replicas: {current_replicas}")
+
+        # Skip scaling if both sources failed
+        if queue_length is None or p99_latency is None:
+            print("Skipping scaling decision: metrics unavailable")
+            time.sleep(INTERVAL)
+            continue
+
+        # ── Scale UP logic ──────────────────────────────
+        if queue_length > SCALE_UP_QUEUE_THRESHOLD or p99_latency > SCALE_UP_LATENCY_THRESHOLD:
+            if now - last_scale_up_time > SCALE_UP_COOLDOWN:
+                if p99_latency > 1.0 or queue_length > 5:
+                    target_replicas = current_replicas + 3
+                else:
+                    target_replicas = current_replicas + 1
+
+                target_replicas = max(MIN_REPLICAS, min(MAX_REPLICAS, target_replicas))
+
+                if target_replicas > current_replicas:
+                    print(f"Scaling UP: {current_replicas} -> {target_replicas}")
+                    scale_deployment(target_replicas)
+                    last_scale_up_time = now
+                else:
+                    print("Already at MAX replicas")
+            else:
+                remaining = int(SCALE_UP_COOLDOWN - (now - last_scale_up_time))
+                print(f"Scale up cooldown: {remaining}s remaining")
+
+        # ── Scale DOWN logic ────────────────────────────
+        elif (queue_length == 0 and
+              0 < p99_latency < SCALE_DOWN_LATENCY_THRESHOLD and
+              current_replicas > MIN_REPLICAS):
+            if now - last_scale_down_time > SCALE_DOWN_COOLDOWN:
+                target_replicas = current_replicas - 1
+                print(f"Scaling DOWN: {current_replicas} -> {target_replicas}")
+                scale_deployment(target_replicas)
+                last_scale_down_time = now
+            else:
+                remaining = int(SCALE_DOWN_COOLDOWN - (now - last_scale_down_time))
+                print(f"Scale down cooldown: {remaining}s remaining")
+
+        else:
+            print("No scaling needed")
+
+        time.sleep(INTERVAL)
+
+
+if __name__ == '__main__':
+    print("Starting Autoscaler...")
+    autoscaler_loop()

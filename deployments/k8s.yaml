@@ -1,10 +1,10 @@
-# ===== RESNET SERVER (Scale to 3 replicas) =====
+# ===== RESNET SERVER (Start at 1 replica, autoscaler scales up) =====
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: resnet-deployment
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: resnet-server
@@ -22,10 +22,8 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: "1G"
             limits:
               cpu: "1"
-              memory: "1G"
 ---
 apiVersion: v1
 kind: Service
@@ -62,13 +60,6 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
-          resources:
-            requests:
-              cpu: "1"
-              memory: "1G"
-            limits:
-              cpu: "1"
-              memory: "1G"
 ---
 apiVersion: v1
 kind: Service
@@ -81,6 +72,7 @@ spec:
     - protocol: TCP
       port: 5000
       targetPort: 5000
+      nodePort: 30001
   type: NodePort
 
 ---
@@ -205,10 +197,3 @@ spec:
           env:
             - name: PROMETHEUS_URL
               value: "http://prometheus:9090"
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "200m"
-              memory: "256Mi"
