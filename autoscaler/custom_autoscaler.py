@@ -18,7 +18,7 @@ INTERVAL             = 5  # check every 5s
 # Thresholds
 SCALE_UP_QUEUE_THRESHOLD     = 2
 SCALE_UP_LATENCY_THRESHOLD   = 0.35   # scale up if p99 > 0.35s
-SCALE_DOWN_LATENCY_THRESHOLD = 0.35   # scale down if p99 < 0.35s
+SCALE_DOWN_LATENCY_THRESHOLD = 0.25   # scale down if p99 < 0.35s
 
 # Cooldown tracking
 last_scale_up_time   = 0
